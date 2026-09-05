@@ -1,0 +1,3 @@
+interface:
+  display_name: "Obsidian Knowledge Maintainer"
+  short_description: "整理、连接并审计本地 Obsidian 知识库"
