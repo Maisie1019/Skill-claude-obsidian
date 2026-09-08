@@ -27,7 +27,16 @@ CLI="$PRODUCT_ROOT/scripts/claude-obsidian.py"
 BUILDER="$PRODUCT_ROOT/integrations/paper-ingest/build_ingest_bundle.py"
 
 APPLY=0
-[[ "${1:-}" == "--apply" ]] && APPLY=1
+REFRESH=()
+for arg in "$@"; do
+  case "$arg" in
+    --apply) APPLY=1 ;;
+    # Rewrites existing source pages whose content changed, discarding any human
+    # annotation on them. Never passed by the nightly run; explicit use only.
+    --refresh-pages) REFRESH=(--refresh-pages) ;;
+    *) echo "未知参数：$arg" >&2; exit 2 ;;
+  esac
+done
 
 TODAY="$(date -u +%Y-%m-%d)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -67,7 +76,7 @@ fi
 log "build ingest bundle"
 set +e
 python3 "$BUILDER" --vault "$VAULT" --out "$BUNDLE" \
-  --operation-id "ingest-papers-$STAMP" --today "$TODAY"
+  --operation-id "ingest-papers-$STAMP" --today "$TODAY" "${REFRESH[@]+"${REFRESH[@]}"}"
 build_rc=$?
 set -e
 

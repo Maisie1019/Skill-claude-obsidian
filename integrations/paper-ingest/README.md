@@ -9,18 +9,40 @@
 
 ```
 daily_paper_report.py
-  └─ obsidian_export.py            Windows，普通文件写入
-       └─ vault/inbox/*.md         可见的资料入口
-            └─ daily_sync.sh       WSL，产品事务
-                 ├─ capture        → .raw/captured/<sha>.md   不可变、仅新增
-                 ├─ ingest         → wiki/sources/*.md
-                 │                   wiki/meta/ledgers/source-ledger.json
-                 │                   wiki/index.md · hot.md · log.md
-                 └─ lint
+  └─ paper_fulltext.py             联网取回论文本身（arXiv / 出版方 / Crossref）
+       └─ obsidian_export.py       Windows，普通文件写入
+            ├─ vault/inbox/*.md              可见的资料入口（含逐字摘录）
+            └─ vault/inbox/fulltext/*.md     全文逐字存档
+                 └─ daily_sync.sh  WSL，产品事务
+                      ├─ capture   → .raw/captured/<sha>.md   不可变、仅新增
+                      ├─ ingest    → wiki/sources/*.md
+                      │              wiki/meta/ledgers/source-ledger.json
+                      │              wiki/index.md · hot.md · log.md
+                      └─ lint
 ```
 
 两个系统之间的接口是 `last_report_papers.json`（schema `daily-paper-report.export.v1`），
 不是渲染后的 HTML。HTML 解析只用于一次性回补历史。
+
+## 原文取回
+
+来源页上的正文一律**逐字**取自论文本身，不做改写或概括——
+概括正是此前那批"只有推断、没有原文"的笔记的成因。
+
+| 站点 | 路径 |
+|---|---|
+| arXiv | Atom API 取元数据 → `arxiv.org/html/<id>`（LaTeXML，真实章节边界）→ PDF |
+| DOI | 出版方落地页优先，Crossref 仅作元数据兜底 |
+| 其他白名单站点 | 直接抓页面，按标题层级切章节 |
+
+Atom API 被限流时（429）不影响取回：渲染页由不同基础设施提供，
+缺元数据也照抓正文，方式字段会记为 `arxiv+html` 而非 `arxiv-api+html`。
+MathML 被折叠回 LaTeX 源码（`alttext`），否则一条公式会展开成几十行散字。
+
+取回失败时来源页明写"未取得原文"，不用模板文字填充。
+
+`inbox/fulltext/` 里的存档就是缓存：已有存档的论文不再联网重取。
+抽取逻辑改进后要重取，用 `obsidian_export.py --from-inbox --fetch-fulltext --refetch --overwrite`。
 
 ## 边界：这里不写断言
 
@@ -50,6 +72,9 @@ wsl -d Ubuntu -u root -- bash /mnt/e/Skills/obsidian-paper/integrations/paper-in
 # 执行
 wsl -d Ubuntu -u root -- bash /mnt/e/Skills/obsidian-paper/integrations/paper-ingest/daily_sync.sh --apply
 
+# 重写既有来源页（抽取逻辑改进后用；会覆盖页面上的人工批注）
+wsl -d Ubuntu -u root -- bash /mnt/e/Skills/obsidian-paper/integrations/paper-ingest/daily_sync.sh --apply --refresh-pages
+
 # 自检
 wsl -d Ubuntu -u root -- bash /mnt/e/Skills/obsidian-paper/integrations/paper-ingest/selftest.sh
 ```
@@ -73,7 +98,10 @@ wsl -d Ubuntu -u root -- bash /mnt/e/Skills/obsidian-paper/integrations/paper-in
 
 * 载荷内容寻址：inbox 文档未变 → capture 零写入。
 * 已存在的来源页不会被覆盖，人工批注得以保留；只刷新其台账记录的 `retrieved_at`。
+  唯一例外是显式的 `--refresh-pages`。
 * 无新增来源时不写 `index` / `hot` / `log`，操作历史不会被空转污染。
+* 全文存档单独登记一条来源记录，`pages` 指向同一个来源页，
+  `independence_key` 与论文相同——同一篇论文不该被算作两个互相印证的来源。
 
 ## 前置条件
 

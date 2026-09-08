@@ -124,6 +124,24 @@ def extract_section(text: str, heading: str) -> Optional[str]:
     return body or None
 
 
+_LEAD_META = re.compile(r"^(抓取方式：|全文存档：|以下句子来自原文)")
+
+
+def strip_lead_meta(body: Optional[str]) -> Optional[str]:
+    """Drop the inbox note's own header lines from a copied verbatim block.
+
+    Those lines carry a wikilink into `inbox/fulltext/`, which resolves from the
+    note but not from `wiki/sources/`. The source page states the payload path in
+    its own meta block instead, so the pointer survives without a broken link.
+    """
+    if not body:
+        return None
+    lines = body.splitlines()
+    while lines and (not lines[0].strip() or _LEAD_META.match(lines[0].strip())):
+        lines.pop(0)
+    return "\n".join(lines).strip() or None
+
+
 def host_of(url: str) -> str:
     from urllib.parse import urlsplit
 
@@ -153,7 +171,10 @@ def yaml_scalar(value: Any) -> str:
 # --------------------------------------------------------------------------
 
 def render_source_page(props: Dict[str, Any], abstract: Optional[str],
-                       locator: str, source_id: str, today: str) -> str:
+                       locator: str, source_id: str, today: str,
+                       excerpts: Optional[str] = None,
+                       quant: Optional[str] = None,
+                       fulltext_locator: Optional[str] = None) -> str:
     title = props.get("title") or "Untitled"
     lines = [
         "---",
@@ -171,6 +192,12 @@ def render_source_page(props: Dict[str, Any], abstract: Optional[str],
             lines.append(f"{key}: {yaml_scalar(props[key])}")
     lines.append(f"evidence_class: {yaml_scalar(props.get('evidence_class') or '规则推断')}")
     lines.append(f"has_abstract: {'true' if abstract else 'false'}")
+    lines.append(f"has_fulltext: {'true' if excerpts else 'false'}")
+    for key in ("fulltext_method", "fulltext_chars"):
+        if props.get(key):
+            lines.append(f"{key}: {yaml_scalar(props[key])}")
+    if fulltext_locator:
+        lines.append(f"fulltext_locator: {yaml_scalar(fulltext_locator)}")
     authors = props.get("authors")
     if isinstance(authors, list) and authors:
         lines.append("authors:")
@@ -193,6 +220,8 @@ def render_source_page(props: Dict[str, Any], abstract: Optional[str],
     if props.get("published"):
         meta.append(f"- 发表：{props['published']}")
     meta.append(f"- 不可变载荷：`{locator}`")
+    if fulltext_locator:
+        meta.append(f"- 全文载荷：`{fulltext_locator}`")
     meta.append(f"- 来源标识：`{source_id}`")
     lines.extend(meta)
     lines.append("")
@@ -204,12 +233,25 @@ def render_source_page(props: Dict[str, Any], abstract: Optional[str],
         lines.append("")
         lines.append("> " + abstract.replace("\n", "\n> "))
         lines.append("")
-    else:
+    elif not excerpts:
         lines.append("## 原文摘要")
         lines.append("")
-        lines.append("> [!warning] 未取得原文摘要")
-        lines.append("> 该来源的摘要无法从公开页面或 Crossref 取得。"
+        lines.append("> [!warning] 未取得原文")
+        lines.append("> 该来源的摘要与全文均无法从公开页面或 Crossref 取得。"
                      "本页仅保留可核验的元数据，不含任何结论性内容。")
+        lines.append("")
+
+    # Verbatim material carried over from the inbox note. Copied, not re-derived:
+    # the point of these blocks is that they are the paper's own words.
+    if excerpts:
+        lines.append("## 原文章节摘录")
+        lines.append("")
+        lines.append(excerpts)
+        lines.append("")
+    if quant:
+        lines.append("## 可核验陈述（含数值或指标）")
+        lines.append("")
+        lines.append(quant)
         lines.append("")
 
     lines.append("## 待人工判断")
@@ -274,7 +316,8 @@ def render_hot(pages: Sequence[Tuple[str, str]], today: str) -> str:
 # bundle
 # --------------------------------------------------------------------------
 
-def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
+def build(vault: Path, operation_id: str, today: str,
+          refresh_pages: bool = False) -> Dict[str, Any]:
     inbox = vault / "inbox"
     captured = vault / ".raw" / "captured"
     ledger_path = vault / "wiki" / "meta" / "ledgers" / "source-ledger.json"
@@ -282,6 +325,20 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
     notes = sorted(p for p in inbox.glob("*.md"))
     if not notes:
         raise SystemExit("inbox 中没有 .md 文件。")
+
+    # Full-text archives live in `inbox/fulltext/` and are keyed back to their
+    # note by the `paper_note` field, so a page can cite its own payload.
+    archives: Dict[str, Tuple[str, str]] = {}
+    for archive in sorted((inbox / "fulltext").glob("*.md")):
+        raw = archive.read_bytes()
+        digest = sha256_bytes(raw)
+        if not (captured / f"{digest}.md").exists():
+            raise SystemExit(
+                f"{archive.name} 尚未 capture（缺 .raw/captured/{digest}.md）。"
+            )
+        note_stem = parse_frontmatter(raw.decode("utf-8")).get("paper_note")
+        if note_stem:
+            archives[str(note_stem)] = (digest, f".raw/captured/{digest}.md")
 
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     sources: Dict[str, Any] = dict(ledger.get("sources") or {})
@@ -291,6 +348,7 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
     index_pages: List[Tuple[str, str]] = []
     summary: List[str] = []
     new_pages = 0
+    refreshed = 0
 
     # Pages already recorded in the ledger stay in the index even after their
     # inbox note is archived, so archiving never orphans a published page.
@@ -321,24 +379,62 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
             host_of(str(props.get("url") or "")), ("unknown", "unknown")
         )
         abstract = extract_section(text, "原文摘要（未改写）")
+        excerpts = strip_lead_meta(extract_section(text, "原文章节摘录（逐字）"))
+        quant = strip_lead_meta(extract_section(text, "可核验陈述（逐字，含数值或指标）"))
+
+        archive_hash, fulltext_locator = archives.get(note.stem, (None, None))
 
         page_name = safe_page_name(str(props.get("title") or note.stem))
         page_path = f"wiki/sources/{page_name}.md"
         title = str(props.get("title") or page_name)
         index_pages.append((page_name, title))
 
-        # Re-runs must not clobber a page a human has since annotated. An
-        # existing page is left exactly as it is; only its ledger record is
-        # refreshed, which is safe because the payload is content-addressed.
-        if (vault / page_path).exists():
-            summary.append(f"已存在，保留 | {page_name}")
-        else:
-            content = render_source_page(props, abstract, locator, source_id, today)
+        current = vault / page_path
+        content = render_source_page(props, abstract, locator, source_id, today,
+                                     excerpts, quant, fulltext_locator)
+        encoded = content.encode("utf-8")
+        marks = "有全文" if excerpts else ("有摘要" if abstract else "无原文")
+
+        if not current.exists():
             writes.append({"path": page_path, "mode": "create", "content": content,
-                           "sha256": sha256_bytes(content.encode("utf-8"))})
+                           "sha256": sha256_bytes(encoded)})
             expected[page_path] = None
             new_pages += 1
-            summary.append(f"{'新增，有摘要' if abstract else '新增，无摘要'} | {page_name}")
+            summary.append(f"新增，{marks} | {page_name}")
+        elif refresh_pages and current.read_bytes() != encoded:
+            # Opt-in only, and it overwrites the whole page: any human annotation
+            # on it is lost. The caller has to ask for this explicitly.
+            writes.append({"path": page_path, "mode": "replace", "content": content,
+                           "sha256": sha256_bytes(encoded)})
+            expected[page_path] = sha256_bytes(current.read_bytes())
+            refreshed += 1
+            summary.append(f"重写，{marks} | {page_name}")
+        else:
+            # Re-runs must not clobber a page a human has since annotated. An
+            # existing page is left exactly as it is; only its ledger record is
+            # refreshed, which is safe because the payload is content-addressed.
+            summary.append(f"已存在，保留 | {page_name}")
+
+        if archive_hash and fulltext_locator:
+            # The verbatim archive is its own piece of evidence and gets its own
+            # ledger record, pointing at the same page. It shares the paper's
+            # independence key: one paper, not two corroborating sources.
+            archive_id = stable_source_id("file", fulltext_locator, archive_hash)
+            prior = sources.get(archive_id) or {}
+            sources[archive_id] = {
+                "origin": {"kind": "file", "locator": fulltext_locator},
+                "title": f"{title}（全文逐字存档）",
+                "content_kind": "document",
+                "authority": authority,
+                "review_status": "active",
+                "content_sha256": archive_hash,
+                "ingested_at": prior.get("ingested_at") or today,
+                "retrieved_at": today,
+                "refresh_due": refresh_due,
+                "independence_key": independence,
+                "pages": [page_path],
+                "supersedes": prior.get("supersedes"),
+            }
 
         previous = sources.get(source_id) or {}
         sources[source_id] = {
@@ -374,7 +470,9 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
                        "sha256": sha256_bytes(encoded)})
         expected[rel] = sha256_bytes(current)
 
-    if new_pages:
+    # The ledger is rewritten whenever its records actually change — a refreshed
+    # `retrieved_at` alone is not worth a transaction, but a new record is.
+    if sources != (ledger.get("sources") or {}) and (new_pages or refreshed):
         rel_ledger = "wiki/meta/ledgers/source-ledger.json"
         ledger_out = {
             "schema": SOURCE_SCHEMA,
@@ -388,6 +486,7 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
                        "sha256": sha256_bytes(ledger_text.encode("utf-8"))})
         expected[rel_ledger] = sha256_bytes(ledger_path.read_bytes())
 
+    if new_pages or refreshed:
         replace_if_changed("wiki/index.md", render_index(index_pages, today))
         replace_if_changed("wiki/hot.md", render_hot(index_pages, today))
 
@@ -395,7 +494,8 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
         entry = (
             f"## {today} — 量化论文日报接入\n\n"
             f"- 操作：`{operation_id}`\n"
-            f"- 新增来源页 {new_pages} 个；索引共 {len(index_pages)} 个来源页。\n"
+            f"- 新增来源页 {new_pages} 个，重写 {refreshed} 个；"
+            f"索引共 {len(index_pages)} 个来源页。\n"
             f"- 断言台账未改动：尚无经人工核验的断言。\n"
             f"- 来源载荷位于 `.raw/captured/`，create-only。\n"
         )
@@ -404,7 +504,7 @@ def build(vault: Path, operation_id: str, today: str) -> Dict[str, Any]:
         )
 
     print("\n".join(summary))
-    print(f"\n新增来源页 {new_pages} 个，共 {len(writes)} 个写入。")
+    print(f"\n新增来源页 {new_pages} 个，重写 {refreshed} 个，共 {len(writes)} 个写入。")
 
     return {
         "schema": SCHEMA,
@@ -423,9 +523,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--operation-id", required=True)
     parser.add_argument("--today", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    parser.add_argument(
+        "--refresh-pages", action="store_true",
+        help="重写内容已变化的既有来源页。会覆盖页面上的人工批注，需明确授权。",
+    )
     args = parser.parse_args(argv)
 
-    bundle = build(Path(args.vault), args.operation_id, args.today)
+    bundle = build(Path(args.vault), args.operation_id, args.today,
+                   refresh_pages=args.refresh_pages)
     if not bundle["writes"]:
         print("没有新的来源需要接入。")
         # Distinct from success so a caller can skip the transaction entirely
