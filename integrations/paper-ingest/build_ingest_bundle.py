@@ -360,6 +360,11 @@ def build(vault: Path, operation_id: str, today: str,
 
     refresh_due = (date.fromisoformat(today) + timedelta(days=REFRESH_DAYS)).isoformat()
 
+    # Source ids that the current inbox state produces, per page. Anything else
+    # still marked `active` for one of these pages is an earlier version of the
+    # same payload, left behind when a note was regenerated.
+    current_ids: Dict[str, List[str]] = {}
+
     for note in notes:
         raw = note.read_bytes()
         text = raw.decode("utf-8")
@@ -420,6 +425,7 @@ def build(vault: Path, operation_id: str, today: str,
             # ledger record, pointing at the same page. It shares the paper's
             # independence key: one paper, not two corroborating sources.
             archive_id = stable_source_id("file", fulltext_locator, archive_hash)
+            current_ids.setdefault(page_path, []).append(archive_id)
             prior = sources.get(archive_id) or {}
             sources[archive_id] = {
                 "origin": {"kind": "file", "locator": fulltext_locator},
@@ -436,6 +442,7 @@ def build(vault: Path, operation_id: str, today: str,
                 "supersedes": prior.get("supersedes"),
             }
 
+        current_ids.setdefault(page_path, []).append(source_id)
         previous = sources.get(source_id) or {}
         sources[source_id] = {
             "origin": {"kind": "file", "locator": locator},
@@ -452,6 +459,52 @@ def build(vault: Path, operation_id: str, today: str,
             "pages": [page_path],
             "supersedes": previous.get("supersedes"),
         }
+
+    # Regenerating a note changes its bytes, so the payload is content-addressed
+    # to a new source id and the old record would sit there `active` forever —
+    # inflating the apparent support behind any claim that cites the page. Retire
+    # them instead of deleting: `superseded` keeps the audit trail, and the
+    # payload under `.raw/captured/` is untouched either way.
+    #
+    # Scope is deliberately tight. Only records this pipeline could have written
+    # are touched: origin kind `file`, a captured payload, and exactly one page,
+    # which is a page the current run rendered.
+    ARCHIVE_MARK = "（全文逐字存档）"
+    retired = 0
+    # (page, is_archive) -> most recent retired id, so the surviving record can
+    # point back at the version it replaced and the chain stays walkable.
+    newest_retired: Dict[Tuple[str, bool], Tuple[str, str]] = {}
+    for stale_id, record in sources.items():
+        if record.get("review_status") != "active":
+            continue
+        pages = record.get("pages") or []
+        if len(pages) != 1 or pages[0] not in current_ids:
+            continue
+        if stale_id in current_ids[pages[0]]:
+            continue
+        origin = record.get("origin") or {}
+        if origin.get("kind") != "file":
+            continue
+        if not str(origin.get("locator") or "").startswith(".raw/captured/"):
+            continue
+        sources[stale_id] = {**record, "review_status": "superseded"}
+        retired += 1
+        key = (pages[0], ARCHIVE_MARK in str(record.get("title") or ""))
+        stamp = str(record.get("ingested_at") or "")
+        if key not in newest_retired or stamp >= newest_retired[key][1]:
+            newest_retired[key] = (stale_id, stamp)
+
+    for page_path, ids in current_ids.items():
+        for source_id in ids:
+            record = sources[source_id]
+            if record.get("supersedes"):
+                continue
+            key = (page_path, ARCHIVE_MARK in str(record.get("title") or ""))
+            if key in newest_retired:
+                record["supersedes"] = newest_retired[key][0]
+
+    if retired:
+        summary.append(f"\n退役旧版本来源记录 {retired} 条（标记 superseded，载荷保留）。")
 
     index_pages = sorted(set(index_pages))
 
@@ -472,7 +525,7 @@ def build(vault: Path, operation_id: str, today: str,
 
     # The ledger is rewritten whenever its records actually change — a refreshed
     # `retrieved_at` alone is not worth a transaction, but a new record is.
-    if sources != (ledger.get("sources") or {}) and (new_pages or refreshed):
+    if sources != (ledger.get("sources") or {}) and (new_pages or refreshed or retired):
         rel_ledger = "wiki/meta/ledgers/source-ledger.json"
         ledger_out = {
             "schema": SOURCE_SCHEMA,
@@ -486,7 +539,7 @@ def build(vault: Path, operation_id: str, today: str,
                        "sha256": sha256_bytes(ledger_text.encode("utf-8"))})
         expected[rel_ledger] = sha256_bytes(ledger_path.read_bytes())
 
-    if new_pages or refreshed:
+    if new_pages or refreshed or retired:
         replace_if_changed("wiki/index.md", render_index(index_pages, today))
         replace_if_changed("wiki/hot.md", render_hot(index_pages, today))
 
@@ -494,7 +547,8 @@ def build(vault: Path, operation_id: str, today: str,
         entry = (
             f"## {today} — 量化论文日报接入\n\n"
             f"- 操作：`{operation_id}`\n"
-            f"- 新增来源页 {new_pages} 个，重写 {refreshed} 个；"
+            f"- 新增来源页 {new_pages} 个，重写 {refreshed} 个，"
+            f"退役旧版本来源记录 {retired} 条；"
             f"索引共 {len(index_pages)} 个来源页。\n"
             f"- 断言台账未改动：尚无经人工核验的断言。\n"
             f"- 来源载荷位于 `.raw/captured/`，create-only。\n"
@@ -504,7 +558,8 @@ def build(vault: Path, operation_id: str, today: str,
         )
 
     print("\n".join(summary))
-    print(f"\n新增来源页 {new_pages} 个，重写 {refreshed} 个，共 {len(writes)} 个写入。")
+    print(f"\n新增来源页 {new_pages} 个，重写 {refreshed} 个，"
+          f"退役 {retired} 条，共 {len(writes)} 个写入。")
 
     return {
         "schema": SCHEMA,
