@@ -265,7 +265,29 @@ def render_source_page(props: Dict[str, Any], abstract: Optional[str],
     return "\n".join(lines)
 
 
-def render_index(pages: Sequence[Tuple[str, str]], today: str) -> str:
+DEFAULT_TAIL_SECTIONS = (
+    "## Concepts\n\n- No concepts indexed yet.\n\n"
+    "## Entities\n\n- No entities indexed yet.\n\n"
+    "## Questions\n\n- No questions indexed yet.\n"
+)
+
+
+def index_tail(existing: str) -> str:
+    """Return everything from `## Concepts` onward, unchanged.
+
+    This pipeline owns the `## Sources` catalog and nothing else. Concepts,
+    entities, and questions are written by `wiki-ingest` when a human decides a
+    source is worth synthesizing; regenerating them from the inbox would delete
+    that work on the next nightly run. Carry them through verbatim instead.
+    """
+    index = existing.find("\n## Concepts")
+    if index == -1:
+        return DEFAULT_TAIL_SECTIONS
+    return existing[index + 1:].rstrip() + "\n"
+
+
+def render_index(pages: Sequence[Tuple[str, str]], today: str,
+                 existing: str = "") -> str:
     lines = [
         "---", "type: meta", "title: Wiki Index", "status: evergreen",
         "created: 2026-09-05", f"updated: {today}",
@@ -276,12 +298,7 @@ def render_index(pages: Sequence[Tuple[str, str]], today: str) -> str:
     ]
     for name, title in sorted(pages, key=lambda item: item[1].lower()):
         lines.append(f"- [[{name}|{title}]]")
-    lines.extend([
-        "", "## Concepts", "", "- No concepts indexed yet.", "",
-        "## Entities", "", "- No entities indexed yet.", "",
-        "## Questions", "", "- No questions indexed yet.", "",
-    ])
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n" + index_tail(existing)
 
 
 def render_log(existing: str, entry: str) -> str:
@@ -310,6 +327,17 @@ def render_hot(pages: Sequence[Tuple[str, str]], today: str) -> str:
         lines.append(f"- [[{name}|{title}]]")
     lines.append("")
     return "\n".join(lines)
+
+
+def merged_pages(prior: Dict[str, Any], page_path: str) -> List[str]:
+    """Keep the source page first, then any page `wiki-ingest` attached later.
+
+    This pipeline rebuilds every record it owns from the inbox on each run. Left
+    alone that would silently drop a concept page a human linked to this source,
+    which is exactly the kind of quiet deletion the ledger exists to prevent.
+    """
+    extra = [p for p in (prior.get("pages") or []) if p != page_path]
+    return [page_path] + extra
 
 
 # --------------------------------------------------------------------------
@@ -349,6 +377,13 @@ def build(vault: Path, operation_id: str, today: str,
     summary: List[str] = []
     new_pages = 0
     refreshed = 0
+    # page path -> note that claimed it. Two inbox notes can land on the same
+    # page: the same paper reached the report twice under titles that differ
+    # only in a journal suffix, or two long titles agree on their first 90
+    # characters. Either way a second write to that path is a duplicate, and
+    # the transaction engine rejects the whole bundle over it.
+    claimed: Dict[str, str] = {}
+    duplicates: List[Tuple[str, str]] = []
 
     # Pages already recorded in the ledger stay in the index even after their
     # inbox note is archived, so archiving never orphans a published page.
@@ -392,6 +427,17 @@ def build(vault: Path, operation_id: str, today: str,
         page_name = safe_page_name(str(props.get("title") or note.stem))
         page_path = f"wiki/sources/{page_name}.md"
         title = str(props.get("title") or page_name)
+
+        if page_path in claimed:
+            # Keep the note that got here first — `notes` is sorted, so the
+            # winner is the same on every run — and report the rest. Merging
+            # them is a judgement about whether they really are one paper, and
+            # deleting the loser destroys evidence; neither belongs in a
+            # nightly script. The skipped note's payload stays in
+            # `.raw/captured/`, so nothing is lost by leaving it for a human.
+            duplicates.append((note.name, claimed[page_path]))
+            continue
+        claimed[page_path] = note.name
         index_pages.append((page_name, title))
 
         current = vault / page_path
@@ -438,7 +484,7 @@ def build(vault: Path, operation_id: str, today: str,
                 "retrieved_at": today,
                 "refresh_due": refresh_due,
                 "independence_key": independence,
-                "pages": [page_path],
+                "pages": merged_pages(prior, page_path),
                 "supersedes": prior.get("supersedes"),
             }
 
@@ -456,7 +502,7 @@ def build(vault: Path, operation_id: str, today: str,
             "retrieved_at": today,
             "refresh_due": refresh_due,
             "independence_key": independence,
-            "pages": [page_path],
+            "pages": merged_pages(previous, page_path),
             "supersedes": previous.get("supersedes"),
         }
 
@@ -506,6 +552,11 @@ def build(vault: Path, operation_id: str, today: str,
     if retired:
         summary.append(f"\n退役旧版本来源记录 {retired} 条（标记 superseded，载荷保留）。")
 
+    if duplicates:
+        summary.append(f"\n重复页名 {len(duplicates)} 条，已跳过，需人工判断是否同一篇：")
+        for skipped_note, kept_note in duplicates:
+            summary.append(f"  跳过 {skipped_note}\n    保留 {kept_note}")
+
     index_pages = sorted(set(index_pages))
 
     def replace_if_changed(rel: str, content: str) -> None:
@@ -540,7 +591,10 @@ def build(vault: Path, operation_id: str, today: str,
         expected[rel_ledger] = sha256_bytes(ledger_path.read_bytes())
 
     if new_pages or refreshed or retired:
-        replace_if_changed("wiki/index.md", render_index(index_pages, today))
+        replace_if_changed("wiki/index.md", render_index(
+            index_pages, today,
+            (vault / "wiki" / "index.md").read_text(encoding="utf-8"),
+        ))
         replace_if_changed("wiki/hot.md", render_hot(index_pages, today))
 
         log_path = vault / "wiki" / "log.md"
